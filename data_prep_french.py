@@ -4,7 +4,7 @@ import os
 import json
 import random
 import logging
-import numpy np
+import numpy as np
 import torch
 import time
 from pathlib import Path
