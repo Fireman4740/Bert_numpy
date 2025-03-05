@@ -38,11 +38,7 @@ class RotaryEmbedding(nn.Module):
 
     def forward(self, x, seq_len: int):
         # x: [batch_size, n_heads, seq_len, head_dim]
-        # Vérifier si nous devons mettre à jour le cache
-        if (self.max_seq_len_cached is None or
-            seq_len > self.max_seq_len_cached or
-            self.cos_cached is None or
-            self.sin_cached is None):
+        if self.max_seq_len_cached is None or seq_len > self.max_seq_len_cached or self.cos_cached is None or self.sin_cached is None:
             self._update_cache(seq_len)
 
         cos = self.cos_cached[:seq_len].to(x.device)
@@ -375,7 +371,8 @@ class NeoBERTMoBA(nn.Module):
                 hidden_states = torch.utils.checkpoint.checkpoint(
                     create_custom_forward(layer),
                     hidden_states,
-                    extended_attention_mask
+                    extended_attention_mask,
+                    use_reentrant=False  # Ajout pour éviter l'avertissement
                 )
             else:
                 hidden_states = layer(hidden_states, extended_attention_mask)
@@ -397,10 +394,26 @@ class NeoBERTMoBA(nn.Module):
         if labels is not None:
             # Calculate MLM loss - ignore padding tokens (-100)
             loss_fct = nn.CrossEntropyLoss(ignore_index=-100)
-            # Flatten the tokens
-            active_loss = labels.view(-1) != -100
-            active_logits = prediction_scores.view(-1, self.config["vocab_size"])[active_loss]
-            active_labels = labels.view(-1)[active_loss]
+
+            # Flatten the tensors
+            flattened_logits = prediction_scores.view(-1, self.config["vocab_size"])
+            flattened_labels = labels.view(-1)
+
+            # Filtrer les positions actives (non -100)
+            active_loss = flattened_labels != -100
+            active_logits = flattened_logits[active_loss]
+            active_labels = flattened_labels[active_loss]
+
+            # Vérifier et clipper les labels hors limites
+            vocab_size = self.config["vocab_size"]
+            invalid_labels = (active_labels < 0) | (active_labels >= vocab_size)
+            if invalid_labels.any():
+                print(f"Warning: {invalid_labels.sum().item()} labels hors limites détectés! "
+                    f"Min: {active_labels.min().item()}, Max: {active_labels.max().item()}, Vocab Size: {vocab_size}")
+                # Clipper les labels pour éviter l'erreur CUDA
+                active_labels = torch.clamp(active_labels, 0, vocab_size - 1)
+
+            # Calculer la perte avec les labels valides
             loss = loss_fct(active_logits, active_labels)
 
         outputs = {
@@ -415,7 +428,6 @@ class NeoBERTMoBA(nn.Module):
             outputs['hidden_states'] = all_hidden_states
 
         return outputs
-
     def switch_attention_mode(self, layer_idx, use_moba):
         """
         Switches a specific layer between MoBA and Full Attention
