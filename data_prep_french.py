@@ -4,7 +4,7 @@ import os
 import json
 import random
 import logging
-import numpy as np
+import numpy np
 import torch
 import time
 from pathlib import Path
@@ -266,7 +266,29 @@ class FrenchDataPreparation:
             self.tokenizer = self.train_tokenizer(dataset)
             tokenized_dataset = self.tokenize_dataset(dataset)
 
-        # Créer le dataset MLM
+        # Vérifier explicitement le tokenizer avant de créer le MLM dataset
+        if self.tokenizer is None:
+            # Si vous avez déjà un tokenizer sauvegardé, le charger
+            tokenizer_dir = os.path.join(self.base_dir, "tokenizer")
+            if os.path.exists(os.path.join(tokenizer_dir, "french_tokenizer.json")):
+                from transformers import PreTrainedTokenizerFast
+                self.tokenizer = PreTrainedTokenizerFast(
+                    tokenizer_file=os.path.join(tokenizer_dir, "french_tokenizer.json"),
+                    unk_token="[UNK]",
+                    cls_token="[CLS]",
+                    sep_token="[SEP]",
+                    pad_token="[PAD]",
+                    mask_token="[MASK]",
+                    model_max_length=self.max_length,
+                )
+                logger.info(f"Tokenizer chargé depuis {tokenizer_dir}")
+            else:
+                # Si on n'a toujours pas de tokenizer, utiliser un tokenizer par défaut
+                logger.warning("Impossible de charger ou créer un tokenizer! Utilisation d'un tokenizer par défaut.")
+                from transformers import BertTokenizerFast
+                self.tokenizer = BertTokenizerFast.from_pretrained("bert-base-multilingual-cased")
+
+        # Créer le dataset MLM avec le tokenizer vérifié
         mlm_dataset = self.create_mlm_dataset(tokenized_dataset)
 
         # Préparer les dataloaders avec les tailles de batch appropriées
@@ -298,6 +320,7 @@ class FrenchDataPreparation:
             return result
         else:
             return result["main"]
+
     def train_tokenizer(self, dataset, vocab_size: int = None, max_examples=10000):
         """
         Entraîne un tokenizer WordPiece adapté au français sur le dataset fourni
@@ -456,11 +479,46 @@ class FrenchDataPreparation:
         """
         Crée un dataset PyTorch pour l'entraînement MLM
         """
+        # Vérifier si le tokenizer est initialisé
+        if self.tokenizer is None:
+            logger.warning("Le tokenizer n'est pas initialisé. Tentative de chargement...")
+            
+            # Tenter de charger un tokenizer sauvegardé
+            tokenizer_dir = os.path.join(self.base_dir, "tokenizer")
+            if os.path.exists(os.path.join(tokenizer_dir, "french_tokenizer.json")):
+                from transformers import PreTrainedTokenizerFast
+                self.tokenizer = PreTrainedTokenizerFast(
+                    tokenizer_file=os.path.join(tokenizer_dir, "french_tokenizer.json"),
+                    unk_token="[UNK]",
+                    cls_token="[CLS]",
+                    sep_token="[SEP]",
+                    pad_token="[PAD]",
+                    mask_token="[MASK]",
+                    model_max_length=self.max_length,
+                )
+                logger.info(f"Tokenizer chargé depuis {tokenizer_dir}")
+            else:
+                # Utiliser un tokenizer par défaut en dernier recours
+                logger.warning("Aucun tokenizer trouvé. Utilisation d'un tokenizer par défaut.")
+                from transformers import BertTokenizerFast
+                self.tokenizer = BertTokenizerFast.from_pretrained("bert-base-multilingual-cased")
+
         class MLMDataset(TorchDataset):
             def __init__(self, tokenized_dataset, tokenizer, mlm_probability=0.15):
                 self.tokenized_dataset = tokenized_dataset
                 self.tokenizer = tokenizer
                 self.mlm_probability = mlm_probability
+                
+                # Définir des valeurs par défaut si le tokenizer est None
+                if self.tokenizer is None:
+                    logger.warning("Attention: Tokenizer non initialisé! Utilisation de valeurs par défaut.")
+                    self.pad_token_id = 0
+                    self.mask_token_id = 1
+                    self.vocab_size = 30000
+                else:
+                    self.pad_token_id = self.tokenizer.pad_token_id
+                    self.mask_token_id = self.tokenizer.convert_tokens_to_ids(self.tokenizer.mask_token)
+                    self.vocab_size = len(self.tokenizer)
 
             def __len__(self):
                 return len(self.tokenized_dataset)
@@ -484,7 +542,7 @@ class FrenchDataPreparation:
                 probability_matrix.masked_fill_(special_tokens_mask, value=0.0)
 
                 # Ne pas masquer les tokens de padding
-                padding_mask = input_ids.eq(self.tokenizer.pad_token_id)
+                padding_mask = input_ids.eq(self.pad_token_id)
                 probability_matrix.masked_fill_(padding_mask, value=0.0)
 
                 # Appliquer le masque aléatoirement
@@ -495,11 +553,11 @@ class FrenchDataPreparation:
 
                 # 80% des tokens masqués deviennent [MASK]
                 indices_replaced = torch.bernoulli(torch.full(labels.shape, 0.8)).bool() & masked_indices
-                input_ids[indices_replaced] = self.tokenizer.convert_tokens_to_ids(self.tokenizer.mask_token)
+                input_ids[indices_replaced] = self.mask_token_id
 
                 # 10% des tokens masqués sont remplacés par un token aléatoire
                 indices_random = torch.bernoulli(torch.full(labels.shape, 0.5)).bool() & masked_indices & ~indices_replaced
-                random_words = torch.randint(len(self.tokenizer), labels.shape, dtype=torch.long)
+                random_words = torch.randint(self.vocab_size, labels.shape, dtype=torch.long)
                 input_ids[indices_random] = random_words[indices_random]
 
                 return {
@@ -553,64 +611,6 @@ class FrenchDataPreparation:
             )
 
         return {"train": train_dataloader, "val": val_dataloader}
-
-def process_french_data_pipeline(max_examples=5000, batch_size=32):
-    """
-    Exécute le pipeline complet pour la préparation des données françaises
-    """
-    start_time = time.time()
-
-    # Initialisation
-    data_prep = FrenchDataPreparation(
-        base_dir="./data_french",
-        vocab_size=32000,  # Vocabulaire adapté au français
-        max_length=512,    # Longueur standard pour BERT
-        mlm_probability=0.15
-    )
-
-    try:
-        # 1. Téléchargement des données françaises
-        logger.info("=== Étape 1: Téléchargement des données françaises ===")
-        dataset = data_prep.download_french_datasets(max_examples=max_examples)
-
-        # 2. Entraînement du tokenizer
-        logger.info("\n=== Étape 2: Entraînement du tokenizer français ===")
-        tokenizer = data_prep.train_tokenizer(dataset)
-
-        # 3. Tokenisation du dataset
-        logger.info("\n=== Étape 3: Tokenisation du dataset ===")
-        tokenized_dataset = data_prep.tokenize_dataset(dataset)
-
-        # 4. Création du dataset MLM
-        logger.info("\n=== Étape 4: Création du dataset MLM ===")
-        mlm_dataset = data_prep.create_mlm_dataset(tokenized_dataset)
-
-        # 5. Préparation des dataloaders
-        logger.info("\n=== Étape 5: Préparation des dataloaders ===")
-        dataloaders = data_prep.prepare_dataloaders(mlm_dataset, batch_size=batch_size)
-
-        execution_time = time.time() - start_time
-        logger.info(f"\n=== Pipeline terminé en {execution_time/60:.2f} minutes! ===")
-
-        # Afficher les statistiques
-        display_stats(dataset, tokenizer, dataloaders, execution_time)
-
-        return {
-            "dataset": dataset,
-            "tokenizer": tokenizer,
-            "tokenized_dataset": tokenized_dataset,
-            "mlm_dataset": mlm_dataset,
-            "dataloaders": dataloaders
-        }
-
-    except Exception as e:
-        logger.error(f"Erreur dans le pipeline: {e}")
-        import traceback
-        traceback.print_exc()
-        return None
-
-def display_stats(dataset, tokenizer, dataloaders, execution_time):
-    """Affiche des statistiques détaillées sur les données préparées"""
     import tqdm.auto
 
     print("\n============== STATISTIQUES ==============")
