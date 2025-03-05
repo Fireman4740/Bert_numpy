@@ -107,188 +107,179 @@ class MoBAAttention(nn.Module):
         new_shape = x.size()[:-2] + (self.hidden_size,)
         return x.reshape(*new_shape)  # [batch_size, seq_len, hidden_size]
     
-    def forward(self, hidden_states, attention_mask=None, past_key_value=None):
-        batch_size, seq_len = hidden_states.shape[:2]
-        
-        # Linear projections
-        q = self.q_proj(hidden_states)
-        k = self.k_proj(hidden_states)
-        v = self.v_proj(hidden_states)
-        
-        # Split into heads
-        q = self._split_heads(q)  # [batch_size, num_heads, seq_len, head_dim]
-        k = self._split_heads(k)  # [batch_size, num_heads, seq_len, head_dim]
-        v = self._split_heads(v)  # [batch_size, num_heads, seq_len, head_dim]
-        
-        # Apply RoPE to q and k
-        q = self.rotary(q, seq_len)
-        k = self.rotary(k, seq_len)
-        
-        # Split sequence into blocks
-        num_blocks = math.ceil(seq_len / self.block_size)
-        
-        # Compute mean representation for each block
-        block_means = []
-        for i in range(num_blocks):
-            start_idx = i * self.block_size
-            end_idx = min(start_idx + self.block_size, seq_len)
-            if end_idx > start_idx:  # Ensure non-empty block
-                # Mean pooling of keys in this block for all heads
-                # Shape: [batch_size, num_heads, 1, head_dim]
-                block_mean = k[:, :, start_idx:end_idx].mean(dim=2, keepdim=True)
-                block_means.append(block_mean)
-        
-        # Stack block means
-        # Shape: [batch_size, num_heads, num_blocks, head_dim]
-        block_means = torch.cat(block_means, dim=2)
-        
-        # Initialize output tensor
-        attn_output = torch.zeros_like(q)
-        
-        # Process each query token
-        for i in range(seq_len):
-            # Get the current query
-            # Shape: [batch_size, num_heads, 1, head_dim]
-            query = q[:, :, i:i+1]
-            
-            # Compute relevance scores between query and block means
-            # Shape: [batch_size, num_heads, 1, num_blocks]
-            block_scores = torch.matmul(query, block_means.transpose(-1, -2)) * self.scale
-            
-            # Apply causal mask - query can only attend to blocks up to its position
-            current_block = i // self.block_size
-            causal_mask = torch.arange(num_blocks, device=query.device) > current_block
-            block_scores = block_scores.masked_fill(
-                causal_mask.view(1, 1, 1, -1), float('-inf')
-            )
-            
-            # Always include the current block
-            # Set a large positive value to ensure selection
-            block_scores[:, :, :, current_block] = torch.finfo(block_scores.dtype).max
-            
-            # Get top-k blocks (always including current block)
-            # Shape: [batch_size, num_heads, 1, top_k]
-            _, top_k_indices = torch.topk(block_scores, min(self.top_k, num_blocks), dim=-1)
-            
-            # Get keys and values for selected blocks
-            selected_k = []
-            selected_v = []
-            
-            for b in range(batch_size):
-                for h in range(self.num_heads):
-                    k_for_query = []
-                    v_for_query = []
-                    
-                    for block_idx in top_k_indices[b, h, 0]:
-                        block_idx = block_idx.item()
-                        start_idx = block_idx * self.block_size
-                        end_idx = min(start_idx + self.block_size, seq_len)
-                        
-                        # For the current block, apply causal masking
-                        if block_idx == current_block:
-                            k_block = k[b, h:h+1, start_idx:i+1]  # Up to current position
-                            v_block = v[b, h:h+1, start_idx:i+1]
-                        else:
-                            k_block = k[b, h:h+1, start_idx:end_idx]
-                            v_block = v[b, h:h+1, start_idx:end_idx]
-                        
-                        if k_block.size(2) > 0:  # Ensure non-empty block
-                            k_for_query.append(k_block)
-                            v_for_query.append(v_block)
-                    
-                    if k_for_query:
-                        # Concatenate selected keys and values
-                        k_concat = torch.cat(k_for_query, dim=2)  # [1, seq_len_selected, head_dim]
-                        v_concat = torch.cat(v_for_query, dim=2)  # [1, seq_len_selected, head_dim]
-                        
-                        # Compute attention scores
-                        attn_scores = torch.matmul(query[b:b+1, h:h+1], k_concat.transpose(-1, -2)) * self.scale
-                        attn_probs = F.softmax(attn_scores, dim=-1)
-                        
-                        # Apply attention
-                        attn_output[b:b+1, h:h+1, i:i+1] = torch.matmul(attn_probs, v_concat)
-        
-        # Merge heads and project back
-        attn_output = self._merge_heads(attn_output)
-        attn_output = self.o_proj(attn_output)
-        
-        return attn_output
+    def forward(self, input_ids, attention_mask=None, token_type_ids=None, labels=None, return_hidden_states=False):
+        batch_size, seq_len = input_ids.size()
 
+        # Create attention mask if not provided
+        if attention_mask is None:
+            attention_mask = torch.ones(batch_size, seq_len, device=input_ids.device)
 
-class FullAttention(nn.Module):
-    """Standard Self-Attention with RoPE"""
-    def __init__(self, hidden_size: int, num_heads: int):
-        super().__init__()
-        self.hidden_size = hidden_size
-        self.num_heads = num_heads
-        self.head_dim = hidden_size // num_heads
-        
-        self.q_proj = nn.Linear(hidden_size, hidden_size, bias=False)
-        self.k_proj = nn.Linear(hidden_size, hidden_size, bias=False)
-        self.v_proj = nn.Linear(hidden_size, hidden_size, bias=False)
-        self.o_proj = nn.Linear(hidden_size, hidden_size, bias=False)
-        
-        self.rotary = RotaryEmbedding(self.head_dim)
-        
-        self.scale = 1.0 / math.sqrt(self.head_dim)
-        
-    def _split_heads(self, x):
-        # x: [batch_size, seq_len, hidden_size]
-        new_shape = x.size()[:-1] + (self.num_heads, self.head_dim)
-        x = x.view(*new_shape)  # [batch_size, seq_len, num_heads, head_dim]
-        return x.permute(0, 2, 1, 3)  # [batch_size, num_heads, seq_len, head_dim]
-        
-    def _merge_heads(self, x):
-        # x: [batch_size, num_heads, seq_len, head_dim]
-        x = x.permute(0, 2, 1, 3)  # [batch_size, seq_len, num_heads, head_dim]
-        new_shape = x.size()[:-2] + (self.hidden_size,)
-        return x.reshape(*new_shape)  # [batch_size, seq_len, hidden_size]
-    
-    def forward(self, hidden_states, attention_mask=None, past_key_value=None):
-        batch_size, seq_len = hidden_states.shape[:2]
-        
-        # Linear projections
-        q = self.q_proj(hidden_states)
-        k = self.k_proj(hidden_states)
-        v = self.v_proj(hidden_states)
-        
-        # Split into heads
-        q = self._split_heads(q)  # [batch_size, num_heads, seq_len, head_dim]
-        k = self._split_heads(k)  # [batch_size, num_heads, seq_len, head_dim]
-        v = self._split_heads(v)  # [batch_size, num_heads, seq_len, head_dim]
-        
-        # Apply RoPE to q and k
-        q = self.rotary(q, seq_len)
-        k = self.rotary(k, seq_len)
-        
-        # Compute attention scores
-        attention_scores = torch.matmul(q, k.transpose(-1, -2)) * self.scale
-        
-        # Apply causal mask
-        causal_mask = torch.triu(
-            torch.ones((seq_len, seq_len), dtype=torch.bool, device=q.device),
-            diagonal=1
-        )
-        attention_scores = attention_scores.masked_fill(
-            causal_mask.unsqueeze(0).unsqueeze(0), float('-inf')
-        )
-        
-        # Apply attention mask if provided
-        if attention_mask is not None:
-            attention_scores = attention_scores + attention_mask
-        
-        # Calculate attention probabilities
-        attention_probs = F.softmax(attention_scores, dim=-1)
-        
-        # Apply attention
-        context = torch.matmul(attention_probs, v)
-        
-        # Merge heads and project back
-        context = self._merge_heads(context)
-        attn_output = self.o_proj(context)
-        
-        return attn_output
+        # Convert to extended attention mask (1.0 for tokens to attend, 0.0 for masked tokens)
+        extended_attention_mask = attention_mask.unsqueeze(1).unsqueeze(2)
+        extended_attention_mask = (1.0 - extended_attention_mask) * -10000.0
 
+        # Process embeddings
+        hidden_states = self.embeddings(input_ids)
+
+        # Store all hidden states if requested
+        all_hidden_states = [] if return_hidden_states else None
+
+        # Forward through all layers with gradient checkpointing
+        for i, layer in enumerate(self.layers):
+            if return_hidden_states:
+                all_hidden_states.append(hidden_states)
+
+            # Apply gradient checkpointing if in training mode
+            if self.training:
+                def create_custom_forward(module):
+                    def custom_forward(*inputs):
+                        return module(*inputs)
+                    return custom_forward
+
+                hidden_states = torch.utils.checkpoint.checkpoint(
+                    create_custom_forward(layer),
+                    hidden_states,
+                    extended_attention_mask
+                )
+            else:
+                hidden_states = layer(hidden_states, extended_attention_mask)
+
+        # Final layer norm
+        hidden_states = self.final_norm(hidden_states)
+
+        if return_hidden_states:
+            all_hidden_states.append(hidden_states)
+
+        # MLM head
+        mlm_output = self.mlm_dense(hidden_states)
+        mlm_output = F.gelu(mlm_output)
+        mlm_output = self.mlm_norm(mlm_output)
+        prediction_scores = self.mlm_head(mlm_output)
+
+        # Calculate loss if labels are provided
+        loss = None
+        if labels is not None:
+            # Calculate MLM loss - ignore padding tokens (-100)
+            loss_fct = nn.CrossEntropyLoss(ignore_index=-100)
+            # Flatten the tokens
+            active_loss = labels.view(-1) != -100
+            active_logits = prediction_scores.view(-1, self.config["vocab_size"])[active_loss]
+            active_labels = labels.view(-1)[active_loss]
+            loss = loss_fct(active_logits, active_labels)
+
+        outputs = {
+            'last_hidden_state': hidden_states,
+            'prediction_logits': prediction_scores,
+        }
+
+        if loss is not None:
+            outputs['loss'] = loss
+
+        if return_hidden_states:
+            outputs['hidden_states'] = all_hidden_states
+
+        return outputs
+    class FullAttention(nn.Module):
+        """Standard Self-Attention with RoPE"""
+        def __init__(self, hidden_size: int, num_heads: int):
+            super().__init__()
+            self.hidden_size = hidden_size
+            self.num_heads = num_heads
+            self.head_dim = hidden_size // num_heads
+            
+            self.q_proj = nn.Linear(hidden_size, hidden_size, bias=False)
+            self.k_proj = nn.Linear(hidden_size, hidden_size, bias=False)
+            self.v_proj = nn.Linear(hidden_size, hidden_size, bias=False)
+            self.o_proj = nn.Linear(hidden_size, hidden_size, bias=False)
+            
+            self.rotary = RotaryEmbedding(self.head_dim)
+            
+            self.scale = 1.0 / math.sqrt(self.head_dim)
+            
+        def _split_heads(self, x):
+            # x: [batch_size, seq_len, hidden_size]
+            new_shape = x.size()[:-1] + (self.num_heads, self.head_dim)
+            x = x.view(*new_shape)  # [batch_size, seq_len, num_heads, head_dim]
+            return x.permute(0, 2, 1, 3)  # [batch_size, num_heads, seq_len, head_dim]
+            
+        def _merge_heads(self, x):
+            # x: [batch_size, num_heads, seq_len, head_dim]
+            x = x.permute(0, 2, 1, 3)  # [batch_size, seq_len, num_heads, head_dim]
+            new_shape = x.size()[:-2] + (self.hidden_size,)
+            return x.reshape(*new_shape)  # [batch_size, seq_len, hidden_size]
+        
+        def forward(self, input_ids, attention_mask=None, token_type_ids=None, labels=None, return_hidden_states=False):
+            batch_size, seq_len = input_ids.size()
+
+            # Create attention mask if not provided
+            if attention_mask is None:
+                attention_mask = torch.ones(batch_size, seq_len, device=input_ids.device)
+
+            # Convert to extended attention mask (1.0 for tokens to attend, 0.0 for masked tokens)
+            extended_attention_mask = attention_mask.unsqueeze(1).unsqueeze(2)
+            extended_attention_mask = (1.0 - extended_attention_mask) * -10000.0
+
+            # Process embeddings
+            hidden_states = self.embeddings(input_ids)
+
+            # Store all hidden states if requested
+            all_hidden_states = [] if return_hidden_states else None
+
+            # Forward through all layers with gradient checkpointing
+            for i, layer in enumerate(self.layers):
+                if return_hidden_states:
+                    all_hidden_states.append(hidden_states)
+
+                # Apply gradient checkpointing if in training mode
+                if self.training:
+                    def create_custom_forward(module):
+                        def custom_forward(*inputs):
+                            return module(*inputs)
+                        return custom_forward
+
+                    hidden_states = torch.utils.checkpoint.checkpoint(
+                        create_custom_forward(layer),
+                        hidden_states,
+                        extended_attention_mask
+                    )
+                else:
+                    hidden_states = layer(hidden_states, extended_attention_mask)
+
+            # Final layer norm
+            hidden_states = self.final_norm(hidden_states)
+
+            if return_hidden_states:
+                all_hidden_states.append(hidden_states)
+
+            # MLM head
+            mlm_output = self.mlm_dense(hidden_states)
+            mlm_output = F.gelu(mlm_output)
+            mlm_output = self.mlm_norm(mlm_output)
+            prediction_scores = self.mlm_head(mlm_output)
+
+            # Calculate loss if labels are provided
+            loss = None
+            if labels is not None:
+                # Calculate MLM loss - ignore padding tokens (-100)
+                loss_fct = nn.CrossEntropyLoss(ignore_index=-100)
+                # Flatten the tokens
+                active_loss = labels.view(-1) != -100
+                active_logits = prediction_scores.view(-1, self.config["vocab_size"])[active_loss]
+                active_labels = labels.view(-1)[active_loss]
+                loss = loss_fct(active_logits, active_labels)
+
+            outputs = {
+                'last_hidden_state': hidden_states,
+                'prediction_logits': prediction_scores,
+            }
+
+            if loss is not None:
+                outputs['loss'] = loss
+
+            if return_hidden_states:
+                outputs['hidden_states'] = all_hidden_states
+
+            return outputs
 
 class NeoBERTMoBALayer(nn.Module):
     """NeoBERT Layer with MoBA or Full Attention"""
