@@ -19,7 +19,7 @@ from torch.utils.tensorboard import SummaryWriter
 
 # Supposez que ces imports proviennent de vos modules précédents
 from model_architecture import NeoBERTMoBA, create_neobert_moba_model, create_neobert_moba_t4_model
-from data_prep_french import DataPreparation
+from data_prep_french import FrenchDataPreparation
 
 # Configuration logging
 logging.basicConfig(
@@ -974,7 +974,7 @@ def main():
         }
 
     # Préparation des données
-    data_prep = DataPreparation(
+    data_prep = FrenchDataPreparation(
         base_dir=args.data_dir,
         vocab_size=model_config["vocab_size"],
         max_length=model_config["max_position_embeddings"],
