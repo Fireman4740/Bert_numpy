@@ -14,10 +14,9 @@ import torch.nn.functional as F
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
-from torch.cuda.amp import GradScaler, autocast
 from torch.utils.tensorboard import SummaryWriter
 
-# Supposez que ces imports proviennent de vos modules précédents
+# Imports des modules personnalisés
 from model_architecture import NeoBERTMoBA, create_neobert_moba_model, create_neobert_moba_t4_model
 from data_prep_french import FrenchDataPreparation
 
@@ -142,8 +141,8 @@ class NeoBERTMoBATrainer:
         if self.lr_scheduler is None:
             self.lr_scheduler = self._create_scheduler()
 
-        # Mixed precision training
-        self.scaler = GradScaler() if args.fp16 else None
+        # Mixed precision training - MISE À JOUR pour utiliser la nouvelle API AMP
+        self.scaler = torch.amp.GradScaler('cuda') if args.fp16 else None
 
         # Tensorboard logging
         self.tb_writer = None
@@ -165,12 +164,12 @@ class NeoBERTMoBATrainer:
         optimizer_grouped_parameters = [
             {
                 "params": [p for n, p in self.model.named_parameters()
-                           if not any(nd in n for nd in no_decay)],
+                          if not any(nd in n for nd in no_decay)],
                 "weight_decay": self.args.weight_decay,
             },
             {
                 "params": [p for n, p in self.model.named_parameters()
-                           if any(nd in n for nd in no_decay)],
+                          if any(nd in n for nd in no_decay)],
                 "weight_decay": 0.0,
             },
         ]
@@ -317,14 +316,34 @@ class NeoBERTMoBATrainer:
         # Move batch to device
         batch = {k: v.to(self.device) for k, v in batch.items()}
 
-        # Mixed precision forward pass
+        # Mixed precision forward pass - MISE À JOUR pour utiliser la nouvelle API AMP
         if self.args.fp16:
-            with autocast():
+            with torch.amp.autocast('cuda'):
                 outputs = self.model(**batch)
-                loss = outputs['loss'] if 'loss' in outputs else outputs['prediction_logits'].view(-1, outputs['prediction_logits'].size(-1)).gather(1, batch['labels'].view(-1, 1)).mean()
+                loss = outputs['loss'] if 'loss' in outputs else None
+
+                # Si le modèle ne calcule pas directement la perte, la calculer ici
+                if loss is None:
+                    prediction_logits = outputs['prediction_logits']
+                    labels = batch['labels']
+                    loss_fct = nn.CrossEntropyLoss(ignore_index=-100)
+                    active_loss = labels.view(-1) != -100
+                    active_logits = prediction_logits.view(-1, prediction_logits.size(-1))[active_loss]
+                    active_labels = labels.view(-1)[active_loss]
+                    loss = loss_fct(active_logits, active_labels)
         else:
             outputs = self.model(**batch)
-            loss = outputs['loss'] if 'loss' in outputs else outputs['prediction_logits'].view(-1, outputs['prediction_logits'].size(-1)).gather(1, batch['labels'].view(-1, 1)).mean()
+            loss = outputs['loss'] if 'loss' in outputs else None
+
+            # Si le modèle ne calcule pas directement la perte, la calculer ici
+            if loss is None:
+                prediction_logits = outputs['prediction_logits']
+                labels = batch['labels']
+                loss_fct = nn.CrossEntropyLoss(ignore_index=-100)
+                active_loss = labels.view(-1) != -100
+                active_logits = prediction_logits.view(-1, prediction_logits.size(-1))[active_loss]
+                active_labels = labels.view(-1)[active_loss]
+                loss = loss_fct(active_logits, active_labels)
 
         # Scale loss for gradient accumulation
         loss = loss / self.args.gradient_accumulation_steps
@@ -352,6 +371,13 @@ class NeoBERTMoBATrainer:
                 self.tb_writer.add_scalar('lr', self.lr_scheduler.get_last_lr()[0], self.global_step)
                 self.tb_writer.add_scalar('loss', avg_loss, self.global_step)
 
+                # Ajouter des métriques supplémentaires pour le monitoring MOBA
+                model = self.model.module if hasattr(self.model, "module") else self.model
+                if hasattr(model, "config") and "hybrid_layer_count" in model.config:
+                    self.tb_writer.add_scalar('moba/hybrid_layer_count',
+                                             model.config["hybrid_layer_count"],
+                                             self.global_step)
+
             # Log dans la console
             logger.info(f"Step {self.global_step}: loss = {avg_loss:.4f}, lr = {self.lr_scheduler.get_last_lr()[0]:.8f}")
 
@@ -370,7 +396,17 @@ class NeoBERTMoBATrainer:
 
             with torch.no_grad():
                 outputs = self.model(**batch)
-                loss = outputs['loss'] if 'loss' in outputs else outputs['prediction_logits'].view(-1, outputs['prediction_logits'].size(-1)).gather(1, batch['labels'].view(-1, 1)).mean()
+                loss = outputs['loss'] if 'loss' in outputs else None
+
+                # Si le modèle ne calcule pas directement la perte, la calculer ici
+                if loss is None:
+                    prediction_logits = outputs['prediction_logits']
+                    labels = batch['labels']
+                    loss_fct = nn.CrossEntropyLoss(ignore_index=-100)
+                    active_loss = labels.view(-1) != -100
+                    active_logits = prediction_logits.view(-1, prediction_logits.size(-1))[active_loss]
+                    active_labels = labels.view(-1)[active_loss]
+                    loss = loss_fct(active_logits, active_labels)
 
             eval_loss += loss.item()
             nb_eval_steps += 1
@@ -485,498 +521,123 @@ class NeoBERTMoBATrainer:
         model.switch_to_hybrid_mode(hybrid_count)
 
 
-def train_phase1(data_prep, model_config, training_args=None):
-    """Phase 1: Pré-entraînement initial (1024 tokens)"""
+def train_t4_test(data_prep, model_config=None):
+    """Version simplifiée pour tester l'architecture sur T4 avec un petit dataset"""
 
-    # Configuration pour Phase 1
-    if training_args is None:
-        training_args = TrainingArguments(
-            output_dir="./outputs/phase1",
-            logging_dir="./logs/phase1",
-            training_phase=1,
+    # Configuration pour le test
+    training_args = TrainingArguments(
+        output_dir="./outputs/t4_test",
+        logging_dir="./logs/t4_test",
+        training_phase=1,
 
-            # Hyperparamètres spécifiques à Phase 1
-            learning_rate=6e-4,
-            warmup_steps=2000,
-            weight_decay=0.1,
-            max_grad_norm=1.0,
+        # Hyperparamètres adaptés pour tests
+        learning_rate=3e-4,
+        warmup_steps=100,
+        weight_decay=0.01,
+        max_grad_norm=1.0,
 
-            # Taille de lot et accumulation
-            per_device_train_batch_size=32,
-            gradient_accumulation_steps=8,
+        # Taille de lot et accumulation adaptées aux T4
+        per_device_train_batch_size=4,
+        gradient_accumulation_steps=2,
 
-            # Durée d'entraînement
-            max_steps=1000000,  # 1M steps comme indiqué dans le protocole
+        # Durée d'entraînement très courte pour les tests
+        max_steps=500,
 
-            # Logging et checkpointing
-            logging_steps=100,
-            save_steps=5000,
-            eval_steps=5000,
+        # Logging et checkpointing plus fréquents
+        logging_steps=10,
+        save_steps=100,
+        eval_steps=100,
 
-            # Pas de MOBA dans la Phase 1
-            moba_activation_step=None,
+        # Activer MOBA après 200 steps
+        moba_activation_step=200,
 
-            # Efficacité
-            fp16=True,
-        )
-
-    # Créer/charger le modèle
-    model = create_neobert_moba_model(model_config)
-
-    # Préparation des données
-    train_dataloader = data_prep.get_dataloaders_for_phase(1, ddp=training_args.local_rank != -1)["main_len1024_bs32"]
-
-    # Créer un dataloader d'évaluation si nécessaire
-    eval_dataloader = None
-
-    # Créer le trainer
-    trainer = NeoBERTMoBATrainer(
-        model=model,
-        args=training_args,
-        train_dataloader=train_dataloader,
-        eval_dataloader=eval_dataloader
+        # Efficacité
+        fp16=True,
     )
-
-    # Entraîner le modèle
-    global_step, avg_loss = trainer.train()
-
-    logger.info(f"Phase 1 terminée. Steps: {global_step}, Perte moyenne: {avg_loss}")
-
-    return model
-
-
-def train_phase2(data_prep, model_config, model=None, training_args=None):
-    """Phase 2: Extension du contexte (4096 tokens)"""
-
-    # Configuration pour Phase 2
-    if training_args is None:
-        training_args = TrainingArguments(
-            output_dir="./outputs/phase2",
-            logging_dir="./logs/phase2",
-            training_phase=2,
-
-            # Hyperparamètres spécifiques à Phase 2
-            learning_rate=3e-4,  # Learning rate plus faible pour fine-tuning
-            warmup_steps=1000,
-            weight_decay=0.1,
-            max_grad_norm=1.0,
-
-            # Taille de lot et accumulation
-            per_device_train_batch_size=4,
-            gradient_accumulation_steps=4,
-
-            # Durée d'entraînement
-            max_steps=50000,  # 50K steps comme indiqué dans le protocole
-
-            # Logging et checkpointing
-            logging_steps=100,
-            save_steps=1000,
-            eval_steps=1000,
-
-            # Pas de MOBA dans la Phase 2
-            moba_activation_step=None,
-
-            # Efficacité
-            fp16=True,
-        )
-
-    # Charger le modèle de la Phase 1 si non fourni
-    if model is None:
-        # Charger le dernier checkpoint de la Phase 1
-        checkpoint_path = "./outputs/phase1/checkpoints/final"
-        model = create_neobert_moba_model(model_config)
-        model.load_state_dict(torch.load(os.path.join(checkpoint_path, "pytorch_model.bin")))
-        logger.info(f"Modèle chargé depuis le checkpoint: {checkpoint_path}")
-
-    # Préparation des données pour Phase 2
-    train_dataloader = data_prep.get_dataloaders_for_phase(2, ddp=training_args.local_rank != -1)
-
-    # Créer un dataloader d'évaluation si nécessaire
-    eval_dataloader = None
-
-    # Créer le trainer
-    trainer = NeoBERTMoBATrainer(
-        model=model,
-        args=training_args,
-        train_dataloader=train_dataloader,
-        eval_dataloader=eval_dataloader
-    )
-
-    # Entraîner le modèle
-    global_step, avg_loss = trainer.train()
-
-    logger.info(f"Phase 2 terminée. Steps: {global_step}, Perte moyenne: {avg_loss}")
-
-    return model
-
-
-def train_phase3(data_prep, model_config, model=None, training_args=None):
-    """Phase 3: Activation MOBA (jusqu'à 32K tokens)"""
-
-    # Configuration pour Phase 3
-    if training_args is None:
-        training_args = TrainingArguments(
-            output_dir="./outputs/phase3",
-            logging_dir="./logs/phase3",
-            training_phase=3,
-
-            # Hyperparamètres spécifiques à Phase 3
-            learning_rate=2e-4,  # Learning rate encore plus faible
-            warmup_steps=500,
-            weight_decay=0.1,
-            max_grad_norm=1.0,
-
-            # Taille de lot et accumulation
-            per_device_train_batch_size=1,  # Séquences très longues
-            gradient_accumulation_steps=8,
-
-            # Durée d'entraînement
-            max_steps=50000,  # 50K steps comme indiqué dans le protocole
-
-            # Activer MOBA après le premier step
-            moba_activation_step=1,
-
-            # Transitions hybrides
-            # À 90% des steps (45000), passer à l'attention complète sur toutes les couches
-            hybrid_layer_transition_steps=[model_config["num_hidden_layers"]] * 45000 + [0] * 5000,
-
-            # Logging et checkpointing
-            logging_steps=50,
-            save_steps=1000,
-            eval_steps=1000,
-
-            # Efficacité
-            fp16=True,
-        )
-
-    # Charger le modèle de la Phase 2 si non fourni
-    if model is None:
-        # Charger le dernier checkpoint de la Phase 2
-        checkpoint_path = "./outputs/phase2/checkpoints/final"
-        model = create_neobert_moba_model(model_config)
-        model.load_state_dict(torch.load(os.path.join(checkpoint_path, "pytorch_model.bin")))
-        logger.info(f"Modèle chargé depuis le checkpoint: {checkpoint_path}")
-
-    # Préparation des données pour Phase 3
-    train_dataloader = data_prep.get_dataloaders_for_phase(3, ddp=training_args.local_rank != -1)
-
-    # Créer un dataloader d'évaluation si nécessaire
-    eval_dataloader = None
-
-    # Créer le trainer
-    trainer = NeoBERTMoBATrainer(
-        model=model,
-        args=training_args,
-        train_dataloader=train_dataloader,
-        eval_dataloader=eval_dataloader
-    )
-
-    # Entraîner le modèle
-    global_step, avg_loss = trainer.train()
-
-    logger.info(f"Phase 3 terminée. Steps: {global_step}, Perte moyenne: {avg_loss}")
-
-    return model
-
-
-def train_phase1_t4(data_prep, model_config, training_args=None):
-    """Phase 1: Pré-entraînement initial adapté pour T4"""
-
-    # Configuration pour Phase 1
-    if training_args is None:
-        training_args = TrainingArguments(
-            output_dir="./outputs/phase1",
-            logging_dir="./logs/phase1",
-            training_phase=1,
-
-            # Hyperparamètres spécifiques à Phase 1
-            learning_rate=6e-4,
-            warmup_steps=1000,  # Réduit de 2000 à 1000
-            weight_decay=0.1,
-            max_grad_norm=1.0,
-
-            # Taille de lot et accumulation adaptées aux T4
-            per_device_train_batch_size=8,  # Réduit de 32 à 8
-            gradient_accumulation_steps=4,  # Réduit de 8 à 4
-
-            # Durée d'entraînement
-            max_steps=5000,  # Réduit pour les tests
-
-            # Logging et checkpointing
-            logging_steps=50,  # Plus fréquent pour les tests
-            save_steps=1000,  # Plus fréquent pour les tests
-            eval_steps=1000,
-
-            # Efficacité
-            fp16=True,
-        )
 
     # Créer la version T4 du modèle
-    model = create_neobert_moba_t4_model() if model_config is None else create_neobert_moba_model(model_config)
-
-    # Préparation des données
-    train_dataloader = data_prep.get_dataloaders_for_phase(1, ddp=training_args.local_rank != -1)["main_len1024_bs8"]  # Ajuster la taille du batch
-
-    # Créer un dataloader d'évaluation si nécessaire
-    eval_dataloader = None
-
-    # Créer le trainer
-    trainer = NeoBERTMoBATrainer(
-        model=model,
-        args=training_args,
-        train_dataloader=train_dataloader,
-        eval_dataloader=eval_dataloader
-    )
-
-    # Entraîner le modèle
-    global_step, avg_loss = trainer.train()
-
-    logger.info(f"Phase 1 terminée. Steps: {global_step}, Perte moyenne: {avg_loss}")
-
-    return model
-
-
-def train_phase2_t4(data_prep, model_config, model=None, training_args=None):
-    """Phase 2: Extension du contexte adaptée pour T4"""
-
-    # Configuration pour Phase 2
-    if training_args is None:
-        training_args = TrainingArguments(
-            output_dir="./outputs/phase2",
-            logging_dir="./logs/phase2",
-            training_phase=2,
-
-            # Hyperparamètres spécifiques à Phase 2
-            learning_rate=3e-4,
-            warmup_steps=500,  # Réduit de 1000 à 500
-            weight_decay=0.1,
-            max_grad_norm=1.0,
-
-            # Taille de lot et accumulation adaptées aux T4
-            per_device_train_batch_size=2,  # Réduit de 4 à 2
-            gradient_accumulation_steps=4,  # Maintenu à 4
-
-            # Durée d'entraînement
-            max_steps=2000,  # Réduit pour les tests
-
-            # Logging et checkpointing
-            logging_steps=50,
-            save_steps=500,
-            eval_steps=500,
-
-            # Pas de MOBA dans la Phase 2
-            moba_activation_step=None,
-
-            # Efficacité
-            fp16=True,
-        )
-
-    # Charger le modèle de la Phase 1 si non fourni
-    if model is None:
-        # Charger le dernier checkpoint de la Phase 1
-        checkpoint_path = "./outputs/phase1/checkpoints/final"
-        model = create_neobert_moba_t4_model() if model_config is None else create_neobert_moba_model(model_config)
-        model.load_state_dict(torch.load(os.path.join(checkpoint_path, "pytorch_model.bin")))
-        logger.info(f"Modèle chargé depuis le checkpoint: {checkpoint_path}")
-
-    # Préparation des données pour Phase 2 avec T4
-    train_dataloader = data_prep.get_dataloaders_for_phase(2, ddp=training_args.local_rank != -1)
-
-    # Créer un dataloader d'évaluation si nécessaire
-    eval_dataloader = None
-
-    # Créer le trainer
-    trainer = NeoBERTMoBATrainer(
-        model=model,
-        args=training_args,
-        train_dataloader=train_dataloader,
-        eval_dataloader=eval_dataloader
-    )
-
-    # Entraîner le modèle
-    global_step, avg_loss = trainer.train()
-
-    logger.info(f"Phase 2 terminée. Steps: {global_step}, Perte moyenne: {avg_loss}")
-
-    return model
-
-
-def train_phase3_t4(data_prep, model_config, model=None, training_args=None):
-    """Phase 3: Activation MOBA adaptée pour T4"""
-
-    # Configuration pour Phase 3
-    if training_args is None:
-        training_args = TrainingArguments(
-            output_dir="./outputs/phase3",
-            logging_dir="./logs/phase3",
-            training_phase=3,
-
-            # Hyperparamètres spécifiques à Phase 3
-            learning_rate=2e-4,
-            warmup_steps=200,  # Réduit de 500 à 200
-            weight_decay=0.1,
-            max_grad_norm=1.0,
-
-            # Taille de lot et accumulation adaptées aux T4
-            per_device_train_batch_size=1,  # Maintenu à 1 (séquences très longues)
-            gradient_accumulation_steps=8,  # Maintenu à 8
-
-            # Durée d'entraînement
-            max_steps=1000,  # Réduit pour les tests
-
-            # Activer MOBA après le premier step
-            moba_activation_step=1,
-
-            # Transitions hybrides
-            hybrid_layer_transition_steps=[model_config["num_hidden_layers"]] * 900 + [0] * 100,
-
-            # Logging et checkpointing
-            logging_steps=25,
-            save_steps=250,
-            eval_steps=500,
-
-            # Efficacité
-            fp16=True,
-        )
-
-    # Charger le modèle de la Phase 2 si non fourni
-    if model is None:
-        # Charger le dernier checkpoint de la Phase 2
-        checkpoint_path = "./outputs/phase2/checkpoints/final"
-        model = create_neobert_moba_t4_model() if model_config is None else create_neobert_moba_model(model_config)
-        model.load_state_dict(torch.load(os.path.join(checkpoint_path, "pytorch_model.bin")))
-        logger.info(f"Modèle chargé depuis le checkpoint: {checkpoint_path}")
-
-    # Préparation des données pour Phase 3 avec T4
-    train_dataloader = data_prep.get_dataloaders_for_phase(3, ddp=training_args.local_rank != -1)
-
-    # Créer un dataloader d'évaluation si nécessaire
-    eval_dataloader = None
-
-    # Créer le trainer
-    trainer = NeoBERTMoBATrainer(
-        model=model,
-        args=training_args,
-        train_dataloader=train_dataloader,
-        eval_dataloader=eval_dataloader
-    )
-
-    # Entraîner le modèle
-    global_step, avg_loss = trainer.train()
-
-    logger.info(f"Phase 3 terminée. Steps: {global_step}, Perte moyenne: {avg_loss}")
-
-    return model
-
-
-def configure_for_kaggle():
-    """Configure l'entraînement pour l'environnement Kaggle avec 2 T4"""
-    import os
-
-    # Détecter si nous sommes dans Kaggle
-    is_kaggle = os.environ.get('KAGGLE_KERNEL_RUN_TYPE', '')
-
-    if is_kaggle:
-        # Configuration pour 2 T4
-        os.environ["CUDA_VISIBLE_DEVICES"] = "0,1"
-
-        # Vérifier les GPUs disponibles
-        import torch
-        num_gpus = torch.cuda.device_count()
-        print(f"Nombre de GPUs disponibles dans Kaggle: {num_gpus}")
-
-        for i in range(num_gpus):
-            print(f"GPU {i}: {torch.cuda.get_device_name(i)}")
-            print(f"Mémoire totale: {torch.cuda.get_device_properties(i).total_memory / 1e9:.2f} GB")
-
-        # Retourner une configuration adaptée
-        return {
-            "max_seq_length": 16384,  # Longueur maximale pour T4
-            "per_gpu_batch_size": {
-                "phase1": 8,
-                "phase2": 2,
-                "phase3": 1
-            },
-            "gradient_accumulation": {
-                "phase1": 4,
-                "phase2": 4,
-                "phase3": 8
-            },
-            "model_config": {
-                "hidden_size": 512,
-                "num_hidden_layers": 16,
-                "num_attention_heads": 8,
-                "max_position_embeddings": 16384
-            }
+    if model_config is None:
+        model_config = {
+            "vocab_size": 30000,
+            "hidden_size": 384,  # Réduit encore plus pour les tests
+            "num_hidden_layers": 8,  # Réduit encore plus pour les tests
+            "num_attention_heads": 8,
+            "max_position_embeddings": 4096,  # Séquences plus courtes pour les tests
+            "moba_block_size": 512,
+            "moba_top_k": 3,
+            "hybrid_layer_count": 2,
         }
-    else:
-        print("Non exécuté dans un environnement Kaggle")
-        return None
+
+    model = create_neobert_moba_model(model_config)
+
+    # Utiliser un sous-ensemble des données pour les tests
+    train_dataloader = data_prep.get_dataloaders_for_phase(1, ddp=training_args.local_rank != -1)["main_len1024_bs8"]
+
+    # Créer un petit dataloader d'évaluation pour les tests
+    eval_dataloader = None  # Optionnel: ajouter un petit jeu d'évaluation
+
+    # Créer le trainer
+    trainer = NeoBERTMoBATrainer(
+        model=model,
+        args=training_args,
+        train_dataloader=train_dataloader,
+        eval_dataloader=eval_dataloader
+    )
+
+    # Entraîner le modèle
+    global_step, avg_loss = trainer.train()
+
+    logger.info(f"Test terminé. Steps: {global_step}, Perte moyenne: {avg_loss}")
+
+    return model
 
 
 def main():
     """Fonction principale qui exécute l'ensemble du protocole d'entraînement"""
 
-    parser = argparse.ArgumentParser(description="Entraînement de NeoBERT-MOBA")
-    parser.add_argument("--phase", type=int, default=1, choices=[1, 2, 3], help="Phase d'entraînement à exécuter")
-    parser.add_argument("--continue_from_checkpoint", type=str, default=None, help="Chemin vers un checkpoint pour continuer l'entraînement")
-    parser.add_argument("--local_rank", type=int, default=-1, help="Rang local pour l'entraînement distribué")
+    parser = argparse.ArgumentParser(description="Test d'entraînement NeoBERT-MOBA sur T4")
+    parser.add_argument("--test", action="store_true", help="Lancer un entraînement de test rapide")
+    parser.add_argument("--phase", type=int, default=1, choices=[1, 2, 3], help="Phase d'entraînement")
+    parser.add_argument("--continue_from_checkpoint", type=str, default=None, help="Chemin vers un checkpoint")
+    parser.add_argument("--local_rank", type=int, default=-1, help="Rang local pour DDP")
     parser.add_argument("--data_dir", type=str, default="./data", help="Répertoire des données")
-    parser.add_argument("--t4_mode", action="store_true", help="Activer le mode optimisé pour GPUs T4")
-    parser.add_argument("--kaggle", action="store_true", help="Optimiser pour l'environnement Kaggle")
-
 
     args = parser.parse_args()
-    # Prioritize environment variable for local_rank (required for torchrun)
+
+    # Priorité à la variable d'environnement LOCAL_RANK (nécessaire pour torchrun)
     if "LOCAL_RANK" in os.environ:
         args.local_rank = int(os.environ["LOCAL_RANK"])
-    # Configuration pour Kaggle si demandé
-    kaggle_config = None
-    if args.kaggle:
-        kaggle_config = configure_for_kaggle()
-        if kaggle_config:
-            args.t4_mode = True  # Activer automatiquement le mode T4 dans Kaggle
 
-    # Initialisation pour distributed training
+    # Configuration pour 2 GPUs T4
+    os.environ["CUDA_VISIBLE_DEVICES"] = "0,1"
+
+    # Initialisation pour entraînement distribué
     if args.local_rank != -1:
         torch.cuda.set_device(args.local_rank)
         dist.init_process_group(backend="nccl")
 
-    # Configuration du modèle
-    model_config = None
-    if args.t4_mode:
-        model_config = {
-            # Configuration NeoBERT réduite pour T4
-            "vocab_size": 30000,
-            "hidden_size": 512,
-            "num_hidden_layers": 16,
-            "num_attention_heads": 8,
-            "max_position_embeddings": 16384,
+    # Afficher les informations sur les GPUs
+    if args.local_rank in [-1, 0]:
+        num_gpus = torch.cuda.device_count()
+        print(f"Nombre de GPUs disponibles: {num_gpus}")
 
-            # Configuration MOBA
-            "moba_block_size": 512,
-            "moba_top_k": 3,
-            "hybrid_layer_count": 2,
-        }
-        # Si nous avons une configuration Kaggle, l'utiliser
-        if kaggle_config:
-            model_config.update(kaggle_config["model_config"])
-    else:
-        model_config = {
-            # Configuration NeoBERT
-            "vocab_size": 30000,
-            "hidden_size": 768,
-            "num_hidden_layers": 28,
-            "num_attention_heads": 12,
-            "max_position_embeddings": 32768,
+        for i in range(num_gpus):
+            print(f"GPU {i}: {torch.cuda.get_device_name(i)}")
+            print(f"Mémoire totale: {torch.cuda.get_device_properties(i).total_memory / 1e9:.2f} GB")
 
-            # Configuration MOBA
-            "moba_block_size": 512,
-            "moba_top_k": 3,
-            "hybrid_layer_count": 3,
-        }
+    # Configuration du modèle réduit pour T4
+    model_config = {
+        "vocab_size": 30000,
+        "hidden_size": 384,  # Réduit pour tests sur T4
+        "num_hidden_layers": 8,  # Réduit pour tests
+        "num_attention_heads": 8,
+        "max_position_embeddings": 4096,  # Plus petit pour tests
+        "moba_block_size": 512,
+        "moba_top_k": 3,
+        "hybrid_layer_count": 2,
+    }
 
-    # Préparation des données
+    # Préparation des données - taille réduite pour tests
     data_prep = FrenchDataPreparation(
         base_dir=args.data_dir,
         vocab_size=model_config["vocab_size"],
@@ -984,44 +645,67 @@ def main():
         mlm_probability=0.15
     )
 
-    # Initialiser le modèle si on ne continue pas depuis un checkpoint
-    model = None
-    if args.continue_from_checkpoint:
-        if args.t4_mode:
-            model = create_neobert_moba_t4_model()
-        else:
-            model = create_neobert_moba_model(model_config)
-        model.load_state_dict(torch.load(os.path.join(args.continue_from_checkpoint, "pytorch_model.bin")))
-        logger.info(f"Modèle chargé depuis le checkpoint: {args.continue_from_checkpoint}")
-
-    # Exécuter la phase d'entraînement spécifiée avec la version appropriée
-    if args.t4_mode:
-        # Utiliser les versions T4 des fonctions d'entraînement
-        if args.phase == 1:
-            model = train_phase1_t4(data_prep, model_config, model)
-        elif args.phase == 2:
-            model = train_phase2_t4(data_prep, model_config, model)
-        elif args.phase == 3:
-            model = train_phase3_t4(data_prep, model_config, model)
+    # Exécuter un entraînement de test rapide
+    if args.test:
+        model = train_t4_test(data_prep, model_config)
+        logger.info("Test d'entraînement terminé avec succès!")
     else:
-        # Version standard
+        # Exécuter selon la phase demandée
         if args.phase == 1:
-            model = train_phase1(data_prep, model_config, model)
-        elif args.phase == 2:
-            model = train_phase2(data_prep, model_config, model)
-        elif args.phase == 3:
-            model = train_phase3(data_prep, model_config, model)
+            # Configuration pour Phase 1 - version T4
+            training_args = TrainingArguments(
+                output_dir="./outputs/phase1",
+                logging_dir="./logs/phase1",
+                training_phase=1,
+
+                # Hyperparamètres spécifiques
+                learning_rate=5e-4,
+                warmup_steps=500,
+                weight_decay=0.1,
+                max_grad_norm=1.0,
+
+                # Taille de lot adaptée aux T4
+                per_device_train_batch_size=6,
+                gradient_accumulation_steps=4,
+
+                # Durée d'entraînement
+                max_steps=5000,
+
+                # Logging et checkpointing
+                logging_steps=50,
+                save_steps=500,
+                eval_steps=500,
+
+                # Pas de MOBA dans la Phase 1
+                moba_activation_step=None,
+
+                # Efficacité
+                fp16=True,
+
+                # DDP
+                local_rank=args.local_rank,
+            )
+
+            model = create_neobert_moba_model(model_config)
+
+            # Préparation des données
+            train_dataloader = data_prep.get_dataloaders_for_phase(1, ddp=training_args.local_rank != -1)["main_len1024_bs8"]
+
+            # Créer le trainer
+            trainer = NeoBERTMoBATrainer(
+                model=model,
+                args=training_args,
+                train_dataloader=train_dataloader,
+                eval_dataloader=None
+            )
+
+            # Entraîner le modèle
+            global_step, avg_loss = trainer.train()
+
+            logger.info(f"Phase 1 terminée. Steps: {global_step}, Perte moyenne: {avg_loss}")
 
     logger.info("Entraînement terminé avec succès!")
 
 
 if __name__ == "__main__":
     main()
-    
-    
-# Le script peut être exécuté avec différentes options:
-
-# --phase: Sélectionne la phase d'entraînement (1, 2 ou 3)
-# --continue_from_checkpoint: Reprend l'entraînement depuis un checkpoint existant
-# --local_rank: Rang local pour l'entraînement distribué
-# --data_dir: Répertoire des données prétraitées
