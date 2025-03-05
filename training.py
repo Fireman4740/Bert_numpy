@@ -19,7 +19,7 @@ from torch.utils.tensorboard import SummaryWriter
 
 # Supposez que ces imports proviennent de vos modules précédents
 from model_architecture import NeoBERTMoBA, create_neobert_moba_model, create_neobert_moba_t4_model
-from data_preparation import DataPreparation
+from data_prep_french import DataPreparation
 
 # Configuration logging
 logging.basicConfig(
