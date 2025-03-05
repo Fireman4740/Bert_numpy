@@ -17,7 +17,7 @@ from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 
 # Imports des modules personnalisés
-from model_architecture import NeoBERTMoBA, create_neobert_moba_model, createneobert_moba_t4_model
+from model_architecture import NeoBERTMoBA, create_neobert_moba_model, create_neobert_moba_t4_model
 from data_prep_french import FrenchDataPreparation
 
 # Configuration logging
