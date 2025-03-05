@@ -7,7 +7,7 @@ import argparse
 from datetime import datetime
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Any, Union, Tuple
-
+from tqdm.auto import tqdm
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -230,12 +230,40 @@ class NeoBERTMoBATrainer:
         self.model.train()
         self.model.zero_grad()
 
-        train_iterator = range(self.args.num_train_epochs)
+        # Barre de progression pour toutes les époques
+        train_iterator = tqdm(range(self.args.num_train_epochs),
+                            desc="Époques",
+                            position=0,
+                            disable=self.args.local_rank not in [-1, 0])
 
         for epoch in train_iterator:
             self.epoch = epoch
             epoch_iterator = self.train_dataloader
 
+            # Calculer le nombre d'étapes pour cette époque
+            epoch_steps = len(epoch_iterator) // self.args.gradient_accumulation_steps
+
+            # Barre de progression pour les batches dans cette époque
+            batch_progress = tqdm(
+                total=epoch_steps,
+                desc=f"Époque {epoch+1}/{self.args.num_train_epochs}",
+                position=1,
+                leave=True,
+                disable=self.args.local_rank not in [-1, 0]
+            )
+
+            # Barre de progression globale (toutes les étapes d'entraînement)
+            if epoch == 0 and self.args.local_rank in [-1, 0]:
+                overall_progress = tqdm(
+                    total=num_training_steps,
+                    desc="Entraînement global",
+                    position=2,
+                    leave=True
+                )
+                # Initialiser à 0 si c'est la première époque
+                overall_progress.update(self.global_step)
+
+            batch_step = 0
             for step, batch in enumerate(epoch_iterator):
                 loss = self._training_step(batch)
 
@@ -261,6 +289,15 @@ class NeoBERTMoBATrainer:
                     self.lr_scheduler.step()
                     self.model.zero_grad()
                     self.global_step += 1
+                    batch_step += 1
+
+                    # Mettre à jour les barres de progression
+                    batch_progress.update(1)
+                    if self.args.local_rank in [-1, 0]:
+                        overall_progress.update(1)
+
+                    # Afficher la perte actuelle dans la description
+                    batch_progress.set_postfix({"loss": f"{loss:.4f}"})
 
                     # Logging
                     if self.args.logging_steps > 0 and self.global_step % self.args.logging_steps == 0:
@@ -274,26 +311,34 @@ class NeoBERTMoBATrainer:
                     if self.args.save_steps > 0 and self.global_step % self.args.save_steps == 0:
                         self._save_checkpoint()
 
-                # Apply MOBA activation at specific step if configured
-                if self.args.moba_activation_step is not None and self.global_step == self.args.moba_activation_step:
-                    self._activate_moba()
+                    # Apply MOBA activation at specific step if configured
+                    if self.args.moba_activation_step is not None and self.global_step == self.args.moba_activation_step:
+                        self._activate_moba()
 
-                # Apply hybrid layer transitions at specific steps if configured
-                if self.args.hybrid_layer_transition_steps:
-                    for step_idx, hybrid_count in enumerate(self.args.hybrid_layer_transition_steps):
-                        if self.global_step == step_idx:
-                            self._set_hybrid_layers(hybrid_count)
+                    # Apply hybrid layer transitions at specific steps if configured
+                    if self.args.hybrid_layer_transition_steps:
+                        for step_idx, hybrid_count in enumerate(self.args.hybrid_layer_transition_steps):
+                            if self.global_step == step_idx:
+                                self._set_hybrid_layers(hybrid_count)
 
-                # Check if we've reached max steps
-                if 0 < self.args.max_steps <= self.global_step:
-                    epoch_iterator.close()
-                    break
+                    # Check if we've reached max steps
+                    if 0 < self.args.max_steps <= self.global_step:
+                        epoch_iterator.close()
+                        batch_progress.close()
+                        if self.args.local_rank in [-1, 0]:
+                            overall_progress.close()
+                        break
+
+            # Fermer la barre de progression des batches
+            batch_progress.close()
 
             # Save checkpoint at the end of each epoch
             self._save_checkpoint(epoch=epoch)
 
             if 0 < self.args.max_steps <= self.global_step:
                 train_iterator.close()
+                if self.args.local_rank in [-1, 0]:
+                    overall_progress.close()
                 break
 
         # Final evaluation
@@ -310,7 +355,6 @@ class NeoBERTMoBATrainer:
         logger.info("***** Entraînement terminé *****")
 
         return self.global_step, self.tr_loss / self.global_step
-
     def _training_step(self, batch):
         """Exécute un pas d'entraînement"""
         # Move batch to device
@@ -391,7 +435,14 @@ class NeoBERTMoBATrainer:
         eval_loss = 0.0
         nb_eval_steps = 0
 
-        for batch in self.eval_dataloader:
+        # Barre de progression pour l'évaluation
+        eval_progress = tqdm(
+            self.eval_dataloader,
+            desc="Évaluation",
+            disable=self.args.local_rank not in [-1, 0]
+        )
+
+        for batch in eval_progress:
             batch = {k: v.to(self.device) for k, v in batch.items()}
 
             with torch.no_grad():
@@ -411,6 +462,10 @@ class NeoBERTMoBATrainer:
             eval_loss += loss.item()
             nb_eval_steps += 1
 
+            # Mettre à jour la description avec la perte actuelle
+            current_loss = eval_loss / nb_eval_steps
+            eval_progress.set_postfix({"loss": f"{current_loss:.4f}"})
+
         eval_loss = eval_loss / nb_eval_steps
 
         # Log les résultats
@@ -426,7 +481,6 @@ class NeoBERTMoBATrainer:
                 self._save_checkpoint(best=True)
 
         self.model.train()
-
     def _save_checkpoint(self, epoch=None, best=False, final=False):
         """Sauvegarde un checkpoint du modèle"""
         if self.args.local_rank in [-1, 0]:
