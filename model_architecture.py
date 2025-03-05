@@ -129,7 +129,6 @@ class MoBAAttention(nn.Module):
         num_blocks = (seq_len + self.block_size - 1) // self.block_size
 
         # Partition des K et V en blocs
-        # On crée une liste de tenseurs où chaque tenseur est un bloc
         k_blocks = []
         v_blocks = []
         for i in range(num_blocks):
@@ -139,7 +138,7 @@ class MoBAAttention(nn.Module):
             v_blocks.append(v[:, :, start_idx:end_idx, :])
 
         # Calculer le bloc moyen pour chaque bloc de K (pour le routage)
-        k_mean_blocks = [k_block.mean(dim=2, keepdim=True) for k_block in k_blocks]  # Moyenne sur la dimension seq_len
+        k_mean_blocks = [k_block.mean(dim=2, keepdim=True) for k_block in k_blocks]
 
         # Préparer le output
         output = torch.zeros_like(q)
@@ -155,7 +154,6 @@ class MoBAAttention(nn.Module):
             affinity_scores = []
             for i, k_mean in enumerate(k_mean_blocks):
                 # Calculer le score d'affinité (produit scalaire)
-                # [batch_size, num_heads, 1, 1]
                 score = torch.matmul(q_pos, k_mean.transpose(-1, -2)) * self.scale
 
                 # Appliquer le masque causal (ne pas attendre aux blocs futurs)
@@ -168,7 +166,6 @@ class MoBAAttention(nn.Module):
             affinity_scores = torch.cat(affinity_scores, dim=-1)  # [batch_size, num_heads, 1, num_blocks]
 
             # Sélectionner les top-k blocs
-            # Toujours inclure le bloc courant + top (k-1) des autres blocs
             topk_values, topk_indices = torch.topk(affinity_scores, self.top_k, dim=-1)
 
             # S'assurer que le bloc courant est toujours inclus
@@ -197,26 +194,12 @@ class MoBAAttention(nn.Module):
             selected_k = torch.cat(selected_k, dim=0).reshape(batch_size, self.num_heads, -1, self.head_dim)
             selected_v = torch.cat(selected_v, dim=0).reshape(batch_size, self.num_heads, -1, self.head_dim)
 
-            # Pour le bloc courant, appliquer masque causal
-            if current_block_idx < num_blocks:
-                # Identifier les positions appartenant au bloc courant
-                start_idx = current_block_idx * self.block_size
-                end_idx = min(start_idx + self.block_size, seq_len)
-
-                # Créer un masque causal pour le bloc courant
-                mask = torch.ones((end_idx - start_idx, end_idx - start_idx), device=q.device)
-                mask = torch.tril(mask).unsqueeze(0).unsqueeze(0)  # [1, 1, block_size, block_size]
-
-                # Appliquer le masque causal lors du calcul des scores d'attention pour le bloc courant
-                # (cette logique serait intégrée aux calculs ci-dessus pour les blocs sélectionnés)
-
             # Calculer l'attention avec les K et V sélectionnés
             attn_scores = torch.matmul(q_pos, selected_k.transpose(-1, -2)) * self.scale
 
             # Optionnel: appliquer un masque d'attention global si fourni
             if attention_mask is not None:
                 # Adapter le masque d'attention aux blocs sélectionnés
-                # Cette logique dépend de la structure exacte du masque d'attention
                 pass
 
             # Softmax et multiplication avec V
@@ -493,3 +476,107 @@ class NeoBERTMoBA(nn.Module):
             outputs['hidden_states'] = all_hidden_states
 
         return outputs
+
+    def switch_attention_mode(self, layer_idx, use_moba):
+        """
+        Switches a specific layer between MoBA and Full Attention
+        Useful for training strategies that transition between attention types
+        """
+        if layer_idx >= len(self.layers):
+            raise ValueError(f"Layer index {layer_idx} is out of range (0-{len(self.layers)-1})")
+
+        hidden_size = self.config["hidden_size"]
+        num_heads = self.config["num_attention_heads"]
+        moba_block_size = self.config["moba_block_size"]
+        moba_top_k = self.config["moba_top_k"]
+
+        # Create new attention module
+        if use_moba:
+            new_attention = MoBAAttention(
+                hidden_size=hidden_size,
+                num_heads=num_heads,
+                block_size=moba_block_size,
+                top_k=moba_top_k
+            )
+        else:
+            new_attention = FullAttention(
+                hidden_size=hidden_size,
+                num_heads=num_heads
+            )
+
+        # Transfer weights if dimensions match
+        old_attention = self.layers[layer_idx].attention
+        new_attention.q_proj.weight.data.copy_(old_attention.q_proj.weight.data)
+        new_attention.k_proj.weight.data.copy_(old_attention.k_proj.weight.data)
+        new_attention.v_proj.weight.data.copy_(old_attention.v_proj.weight.data)
+        new_attention.o_proj.weight.data.copy_(old_attention.o_proj.weight.data)
+
+        # Replace attention module
+        self.layers[layer_idx].attention = new_attention
+        self.layers[layer_idx].use_moba = use_moba
+
+    def switch_to_hybrid_mode(self, hybrid_layer_count):
+        """
+        Switches the model to hybrid mode with the last 'hybrid_layer_count' layers
+        using Full Attention and the rest using MoBA
+        """
+        for i in range(len(self.layers)):
+            use_moba = i < (len(self.layers) - hybrid_layer_count)
+            if use_moba != self.layers[i].use_moba:
+                self.switch_attention_mode(i, use_moba)
+
+        # Update config
+        self.config["hybrid_layer_count"] = hybrid_layer_count
+
+    def switch_to_full_attention(self):
+        """Switches all layers to Full Attention"""
+        for i in range(len(self.layers)):
+            if self.layers[i].use_moba:
+                self.switch_attention_mode(i, False)
+
+        # Update config
+        self.config["hybrid_layer_count"] = len(self.layers)
+
+    def switch_to_full_moba(self):
+        """Switches all layers to MoBA Attention"""
+        for i in range(len(self.layers)):
+            if not self.layers[i].use_moba:
+                self.switch_attention_mode(i, True)
+
+        # Update config
+        self.config["hybrid_layer_count"] = 0
+
+
+def create_neobert_moba_model(config):
+    """
+    Helper function to create a NeoBERT-MOBA model from a configuration
+    """
+    model = NeoBERTMoBA(
+        vocab_size=config.get("vocab_size", 30000),
+        hidden_size=config.get("hidden_size", 768),
+        num_hidden_layers=config.get("num_hidden_layers", 28),
+        num_attention_heads=config.get("num_attention_heads", 12),
+        max_position_embeddings=config.get("max_position_embeddings", 32768),
+        moba_block_size=config.get("moba_block_size", 512),
+        moba_top_k=config.get("moba_top_k", 3),
+        hybrid_layer_count=config.get("hybrid_layer_count", 3),
+    )
+    return model
+
+
+def create_neobert_moba_t4_model():
+    """Crée une version plus petite du modèle adaptée aux GPUs T4"""
+    model_config = {
+        # Configuration NeoBERT réduite pour T4
+        "vocab_size": 30000,
+        "hidden_size": 512,  # Réduit de 768 à 512
+        "num_hidden_layers": 16,  # Réduit de 28 à 16
+        "num_attention_heads": 8,  # Réduit de 12 à 8
+        "max_position_embeddings": 16384,  # Réduit de 32768 à 16384
+
+        # Configuration MOBA
+        "moba_block_size": 512,
+        "moba_top_k": 3,
+        "hybrid_layer_count": 2,  # Réduit de 3 à 2
+    }
+    return create_neobert_moba_model(model_config)
