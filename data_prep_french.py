@@ -29,7 +29,7 @@ class FrenchDataPreparation:
     def __init__(
         self,
         base_dir: str = "./data_french",
-        vocab_size: int = 32000,
+        vocab_size: int = 30000,
         max_length: int = 512,
         mlm_probability: float = 0.15,
         seed: int = 42
@@ -613,7 +613,7 @@ class FrenchDataPreparation:
         return {"train": train_dataloader, "val": val_dataloader}
 
 
-def process_french_data_pipeline(max_examples=5000, batch_size=32, vocab_size=32000, max_length=512):
+def process_french_data_pipeline(max_examples=5000, batch_size=32, vocab_size=3000, max_length=512):
     """
     Pipeline complet pour préparer les données françaises
     """
