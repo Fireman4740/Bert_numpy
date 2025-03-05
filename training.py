@@ -925,8 +925,11 @@ def main():
     parser.add_argument("--t4_mode", action="store_true", help="Activer le mode optimisé pour GPUs T4")
     parser.add_argument("--kaggle", action="store_true", help="Optimiser pour l'environnement Kaggle")
 
-    args = parser.parse_args()
 
+    args = parser.parse_args()
+    # Prioritize environment variable for local_rank (required for torchrun)
+    if "LOCAL_RANK" in os.environ:
+        args.local_rank = int(os.environ["LOCAL_RANK"])
     # Configuration pour Kaggle si demandé
     kaggle_config = None
     if args.kaggle:
