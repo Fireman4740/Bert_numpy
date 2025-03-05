@@ -206,6 +206,98 @@ class FrenchDataPreparation:
 
         return final_dataset
 
+    def get_dataloaders_for_phase(self, phase, ddp=False):
+        """
+        Retourne les dataloaders appropriés pour une phase spécifique d'entraînement.
+        Compatible avec l'API du code d'entraînement NeoBERT-MOBA.
+
+        Args:
+            phase (int): La phase d'entraînement (1, 2 ou 3)
+            ddp (bool): Si True, configure pour l'entraînement distribué
+
+        Returns:
+            dict: Dictionnaire de dataloaders pour la phase
+        """
+        # Vérifier si nous avons déjà des données préparées
+        processed_dir = os.path.join(self.base_dir, "processed")
+        tokenized_dir = os.path.join(processed_dir, "tokenized")
+
+        # Ajuster les paramètres selon la phase
+        if phase == 1:
+            # Phase 1: Séquences courtes (1024 tokens)
+            seq_len = min(1024, self.max_length)
+            batch_sizes = {"main_len1024_bs32": 32, "main_len1024_bs8": 8}
+        elif phase == 2:
+            # Phase 2: Séquences moyennes (4096 tokens)
+            seq_len = min(4096, self.max_length)
+            batch_sizes = {"main": 2}
+        elif phase == 3:
+            # Phase 3: Séquences longues (16k+ tokens)
+            seq_len = self.max_length
+            batch_sizes = {"main": 1}
+        else:
+            raise ValueError(f"Phase inconnue: {phase}")
+
+        # Si le dataset tokenisé existe, le charger
+        if os.path.exists(tokenized_dir):
+            try:
+                from datasets import load_from_disk
+                tokenized_dataset = load_from_disk(tokenized_dir)
+                logger.info(f"Dataset tokenisé chargé: {len(tokenized_dataset)} exemples")
+            except Exception as e:
+                logger.error(f"Erreur lors du chargement du dataset tokenisé: {e}")
+                # Charger ou créer le dataset de base
+                dataset_path = os.path.join(self.base_dir, "raw", "french_dataset.json")
+                if os.path.exists(dataset_path):
+                    from datasets import load_dataset
+                    dataset = load_dataset("json", data_files=dataset_path, split="train")
+                else:
+                    dataset = self.download_french_datasets()
+
+                # Vérifier le tokenizer
+                if self.tokenizer is None:
+                    self.tokenizer = self.train_tokenizer(dataset)
+
+                # Tokeniser le dataset
+                tokenized_dataset = self.tokenize_dataset(dataset)
+        else:
+            # Créer le pipeline complet
+            dataset = self.download_french_datasets()
+            self.tokenizer = self.train_tokenizer(dataset)
+            tokenized_dataset = self.tokenize_dataset(dataset)
+
+        # Créer le dataset MLM
+        mlm_dataset = self.create_mlm_dataset(tokenized_dataset)
+
+        # Préparer les dataloaders avec les tailles de batch appropriées
+        result = {}
+
+        for name, batch_size in batch_sizes.items():
+            # Ajuster le batch_size pour DDP
+            effective_batch_size = batch_size
+            if ddp:
+                # En DDP, chaque processus reçoit une portion des données
+                import torch.distributed as dist
+                world_size = dist.get_world_size() if dist.is_initialized() else 1
+                effective_batch_size = max(1, batch_size // world_size)
+
+            # Créer le dataloader
+            dataloader = DataLoader(
+                mlm_dataset,
+                batch_size=effective_batch_size,
+                shuffle=True,
+                num_workers=min(4, os.cpu_count() or 1),
+                pin_memory=True if torch.cuda.is_available() else False,
+            )
+
+            result[name] = dataloader
+
+        # Si c'est la phase 1, retourner un dictionnaire avec deux tailles de batch
+        # Sinon, retourner directement le dataloader principal
+        if phase == 1:
+            return result
+        else:
+            return result["main"]
     def train_tokenizer(self, dataset, vocab_size: int = None, max_examples=10000):
         """
         Entraîne un tokenizer WordPiece adapté au français sur le dataset fourni
