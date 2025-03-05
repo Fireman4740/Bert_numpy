@@ -7,17 +7,22 @@ import numpy as np
 
 
 class RMSNorm(nn.Module):
-    """Root Mean Square Layer Normalization (RMSNorm)"""
+    """Root Mean Square Layer Normalization (RMSNorm) robuste"""
     def __init__(self, dim: int, eps: float = 1e-6):
         super().__init__()
         self.eps = eps
         self.weight = nn.Parameter(torch.ones(dim))
 
     def forward(self, x):
-        # x: [batch_size, seq_len, dim]
+        # Protection contre les valeurs NaN/Inf
+        if torch.isnan(x).any() or torch.isinf(x).any():
+            print(f"WARNING: NaN or Inf values detected in RMSNorm input! Replacing with zeros.")
+            x = torch.where(torch.isnan(x) | torch.isinf(x), torch.zeros_like(x), x)
+
+        # Calcul RMS avec protection numérique
         variance = x.pow(2).mean(-1, keepdim=True)
-        x = x * torch.rsqrt(variance + self.eps)
-        return x * self.weight
+        norm_x = x * torch.rsqrt(variance + self.eps)
+        return norm_x * self.weight
 
 
 class RotaryEmbedding(nn.Module):
@@ -70,9 +75,7 @@ class SwiGLU(nn.Module):
 
 
 class MoBAAttention(nn.Module):
-    """
-    Mixture of Block Attention (MoBA) - implémentation selon l'article de recherche
-    """
+    """Mixture of Block Attention (MoBA)"""
     def __init__(
         self,
         hidden_size: int,
@@ -87,13 +90,13 @@ class MoBAAttention(nn.Module):
         self.block_size = block_size
         self.top_k = top_k
 
-        # Projections pour Q, K, V
         self.q_proj = nn.Linear(hidden_size, hidden_size, bias=False)
         self.k_proj = nn.Linear(hidden_size, hidden_size, bias=False)
         self.v_proj = nn.Linear(hidden_size, hidden_size, bias=False)
         self.o_proj = nn.Linear(hidden_size, hidden_size, bias=False)
 
         self.rotary = RotaryEmbedding(self.head_dim)
+
         self.scale = 1.0 / math.sqrt(self.head_dim)
 
     def _split_heads(self, x):
@@ -125,7 +128,7 @@ class MoBAAttention(nn.Module):
         q = self.rotary(q, seq_len)
         k = self.rotary(k, seq_len)
 
-        # Calculer le nombre de blocs (arrondi vers le haut si nécessaire)
+        # Calculer le nombre de blocs
         num_blocks = (seq_len + self.block_size - 1) // self.block_size
 
         # Partition des K et V en blocs
@@ -137,83 +140,101 @@ class MoBAAttention(nn.Module):
             k_blocks.append(k[:, :, start_idx:end_idx, :])
             v_blocks.append(v[:, :, start_idx:end_idx, :])
 
-        # Calculer le bloc moyen pour chaque bloc de K (pour le routage)
+        # Calculer le bloc moyen pour chaque bloc de K
         k_mean_blocks = [k_block.mean(dim=2, keepdim=True) for k_block in k_blocks]
 
-        # Préparer le output
-        output = torch.zeros_like(q)
+        # Attention entre Q et les blocs K/V
+        attn_outputs = []
 
-        # Traiter chaque position de query séparément
-        for query_pos in range(seq_len):
-            q_pos = q[:, :, query_pos:query_pos+1, :]  # [batch_size, num_heads, 1, head_dim]
+        for query_pos in range(0, seq_len, 32):  # Traitement par lots de 32 queries
+            end_pos = min(query_pos + 32, seq_len)
+            q_batch = q[:, :, query_pos:end_pos, :]
 
-            # Déterminer le bloc courant
             current_block_idx = query_pos // self.block_size
 
-            # Calculer les scores d'affinité entre la query et chaque bloc
+            # Calculer les scores d'affinité pour tous les blocs
             affinity_scores = []
             for i, k_mean in enumerate(k_mean_blocks):
-                # Calculer le score d'affinité (produit scalaire)
-                score = torch.matmul(q_pos, k_mean.transpose(-1, -2)) * self.scale
+                # Score d'affinité = dot product normalisé
+                score = torch.matmul(q_batch, k_mean.transpose(-1, -2)) * self.scale
 
-                # Appliquer le masque causal (ne pas attendre aux blocs futurs)
+                # Masque causal pour les blocs futurs
                 if i > current_block_idx:
                     score = torch.full_like(score, float('-inf'))
 
                 affinity_scores.append(score)
 
-            # Concaténer les scores
-            affinity_scores = torch.cat(affinity_scores, dim=-1)  # [batch_size, num_heads, 1, num_blocks]
+            # Concaténer et trouver les top-k blocs
+            affinity_scores = torch.cat(affinity_scores, dim=-1)
+            topk_values, topk_indices = torch.topk(affinity_scores,
+                                                 min(self.top_k, len(k_blocks)),
+                                                 dim=-1)
 
-            # Sélectionner les top-k blocs
-            topk_values, topk_indices = torch.topk(affinity_scores, self.top_k, dim=-1)
-
-            # S'assurer que le bloc courant est toujours inclus
+            # Assurer que le bloc courant est inclus
             if self.top_k > 1:
-                has_current_block = (topk_indices == current_block_idx).any(dim=-1, keepdim=True)
-                if not has_current_block.all():
-                    # Remplacer le bloc avec le score le plus bas par le bloc courant
-                    min_value_idx = torch.argmin(topk_values, dim=-1, keepdim=True)
+                for pos in range(end_pos - query_pos):
+                    pos_block_idx = (query_pos + pos) // self.block_size
                     for b in range(batch_size):
                         for h in range(self.num_heads):
-                            idx = min_value_idx[b, h, 0, 0]
-                            topk_indices[b, h, 0, idx] = current_block_idx
+                            if not (topk_indices[b, h, pos] == pos_block_idx).any():
+                                # Remplacer le bloc avec le score le plus bas
+                                min_idx = torch.argmin(topk_values[b, h, pos])
+                                topk_indices[b, h, pos, min_idx] = pos_block_idx
 
-            # Concaténer les valeurs K et V des blocs sélectionnés
-            selected_k = []
-            selected_v = []
-            for b in range(batch_size):
-                for h in range(self.num_heads):
-                    batch_head_indices = topk_indices[b, h, 0]
-                    batch_head_k = torch.cat([k_blocks[idx.item()][b:b+1, h:h+1] for idx in batch_head_indices], dim=2)
-                    batch_head_v = torch.cat([v_blocks[idx.item()][b:b+1, h:h+1] for idx in batch_head_indices], dim=2)
-                    selected_k.append(batch_head_k)
-                    selected_v.append(batch_head_v)
+            # Collecter les K et V pour les blocs sélectionnés
+            batch_outputs = []
 
-            # Reshape et concaténer
-            selected_k = torch.cat(selected_k, dim=0).reshape(batch_size, self.num_heads, -1, self.head_dim)
-            selected_v = torch.cat(selected_v, dim=0).reshape(batch_size, self.num_heads, -1, self.head_dim)
+            for pos in range(end_pos - query_pos):
+                pos_outputs = []
+                current_q = q_batch[:, :, pos:pos+1, :]
 
-            # Calculer l'attention avec les K et V sélectionnés
-            attn_scores = torch.matmul(q_pos, selected_k.transpose(-1, -2)) * self.scale
+                for b in range(batch_size):
+                    for h in range(self.num_heads):
+                        # Récupérer les indices des blocs
+                        block_indices = topk_indices[b, h, pos]
 
-            # Optionnel: appliquer un masque d'attention global si fourni
-            if attention_mask is not None:
-                # Adapter le masque d'attention aux blocs sélectionnés
-                pass
+                        # Concaténer K et V des blocs sélectionnés
+                        selected_k = torch.cat([k_blocks[idx.item()][b:b+1, h:h+1] for idx in block_indices], dim=2)
+                        selected_v = torch.cat([v_blocks[idx.item()][b:b+1, h:h+1] for idx in block_indices], dim=2)
 
-            # Softmax et multiplication avec V
-            attn_probs = F.softmax(attn_scores, dim=-1)
-            pos_output = torch.matmul(attn_probs, selected_v)
+                        # Appliquer l'attention
+                        attn_scores = torch.matmul(current_q[b:b+1, h:h+1],
+                                                  selected_k.transpose(-1, -2)) * self.scale
 
-            # Ajouter au résultat
-            output[:, :, query_pos:query_pos+1, :] = pos_output
+                        # Masque causal à l'intérieur du bloc courant
+                        current_pos = query_pos + pos
+                        current_block_start = (current_pos // self.block_size) * self.block_size
 
-        # Fusionner les têtes d'attention
-        output = self._merge_heads(output)
+                        # Créer un masque causal pour la position actuelle
+                        for idx in block_indices:
+                            block_idx = idx.item()
+                            block_start = block_idx * self.block_size
+                            if block_idx == current_pos // self.block_size:
+                                # Appliquer le masque causal uniquement au bloc courant
+                                for i in range(len(selected_k[0, 0])):
+                                    token_pos = block_start + i
+                                    if token_pos > current_pos:
+                                        attn_scores[0, 0, 0, i] = float('-inf')
 
-        # Projection finale
-        return self.o_proj(output)
+                        # Softmax et produit avec V
+                        attn_probs = F.softmax(attn_scores, dim=-1)
+                        context = torch.matmul(attn_probs, selected_v)
+                        pos_outputs.append(context)
+
+                # Reshape pour avoir la forme correcte
+                pos_context = torch.cat(pos_outputs, dim=0).reshape(batch_size, self.num_heads, 1, self.head_dim)
+                batch_outputs.append(pos_context)
+
+            # Concaténer les résultats de ce batch
+            batch_context = torch.cat(batch_outputs, dim=2)
+            attn_outputs.append(batch_context)
+
+        # Concaténer tous les résultats
+        context = torch.cat(attn_outputs, dim=2)
+
+        # Fusionner les têtes et projeter
+        context = self._merge_heads(context)
+        return self.o_proj(context)
 
 
 class FullAttention(nn.Module):
@@ -336,8 +357,15 @@ class NeoBERTEmbeddings(nn.Module):
         self.word_embeddings = nn.Embedding(vocab_size, hidden_size)
         self.norm = RMSNorm(hidden_size)
         self.dropout = nn.Dropout(0.1)
+        self.vocab_size = vocab_size
 
     def forward(self, input_ids):
+        # Vérifier que les input_ids sont dans les limites valides
+        if (input_ids < 0).any() or (input_ids >= self.vocab_size).any():
+            # Clip les valeurs pour éviter les erreurs
+            input_ids = torch.clamp(input_ids, 0, self.vocab_size - 1)
+            print(f"WARNING: input_ids ont été clippés dans la plage [0, {self.vocab_size-1}]")
+
         embeddings = self.word_embeddings(input_ids)
         embeddings = self.norm(embeddings)
         return self.dropout(embeddings)
@@ -569,14 +597,14 @@ def create_neobert_moba_t4_model():
     model_config = {
         # Configuration NeoBERT réduite pour T4
         "vocab_size": 30000,
-        "hidden_size": 512,  # Réduit de 768 à 512
-        "num_hidden_layers": 16,  # Réduit de 28 à 16
-        "num_attention_heads": 8,  # Réduit de 12 à 8
-        "max_position_embeddings": 16384,  # Réduit de 32768 à 16384
+        "hidden_size": 512,
+        "num_hidden_layers": 16,
+        "num_attention_heads": 8,
+        "max_position_embeddings": 16384,
 
         # Configuration MOBA
         "moba_block_size": 512,
         "moba_top_k": 3,
-        "hybrid_layer_count": 2,  # Réduit de 3 à 2
+        "hybrid_layer_count": 2,
     }
     return create_neobert_moba_model(model_config)
