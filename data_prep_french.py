@@ -611,8 +611,38 @@ class FrenchDataPreparation:
             )
 
         return {"train": train_dataloader, "val": val_dataloader}
-    import tqdm.auto
 
+
+def process_french_data_pipeline(max_examples=5000, batch_size=32, vocab_size=32000, max_length=512):
+    """
+    Pipeline complet pour préparer les données françaises
+    """
+    start_time = time.time()
+    
+    # Initialiser le préparateur de données
+    data_prep = FrenchDataPreparation(
+        vocab_size=vocab_size,
+        max_length=max_length
+    )
+    
+    # Télécharger et préparer le dataset
+    dataset = data_prep.download_french_datasets(max_examples=max_examples)
+    
+    # Entraîner le tokenizer
+    tokenizer = data_prep.train_tokenizer(dataset)
+    
+    # Tokeniser le dataset
+    tokenized_dataset = data_prep.tokenize_dataset(dataset)
+    
+    # Créer le dataset MLM
+    mlm_dataset = data_prep.create_mlm_dataset(tokenized_dataset)
+    
+    # Préparer les dataloaders
+    dataloaders = data_prep.prepare_dataloaders(mlm_dataset, batch_size=batch_size)
+    
+    execution_time = time.time() - start_time
+    
+    # Afficher des statistiques sur les données préparées
     print("\n============== STATISTIQUES ==============")
     print(f"Temps total d'exécution: {execution_time/60:.2f} minutes")
 
@@ -652,6 +682,17 @@ class FrenchDataPreparation:
         print(f"Exemples de validation: ~{len(val_dataloader) * val_dataloader.batch_size}")
 
     print("==========================================")
+    
+    # Retourner les éléments produits par le pipeline
+    return {
+        "dataset": dataset,
+        "tokenizer": tokenizer,
+        "tokenized_dataset": tokenized_dataset,
+        "mlm_dataset": mlm_dataset,
+        "dataloaders": dataloaders,
+        "execution_time": execution_time
+    }
+
 
 if __name__ == "__main__":
     # Installation des dépendances si nécessaires
