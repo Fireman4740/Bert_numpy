@@ -179,7 +179,7 @@ class MoBAAttention(nn.Module):
             outputs['hidden_states'] = all_hidden_states
 
         return outputs
-    class FullAttention(nn.Module):
+class FullAttention(nn.Module):
         """Standard Self-Attention with RoPE"""
         def __init__(self, hidden_size: int, num_heads: int):
             super().__init__()
